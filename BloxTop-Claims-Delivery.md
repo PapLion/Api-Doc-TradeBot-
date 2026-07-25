@@ -1,0 +1,425 @@
+# BloxTop Delivery API - Bot Developer Handoff
+
+This document is for the developer implementing the Roblox delivery bot.
+
+Use this environment only for Stealbox sandbox testing. Do not send these credentials to logs, Discord, GitHub, screenshots, or production.
+
+## Sandbox configuration
+
+```env
+DELIVERY_BASE_URL=https://bloxtop-delivery-sandbox.vercel.app
+DELIVERY_API_KEY=1a7fbd75b08a9a7e491597d51cf40781da5e9045f3c5fa77f5b9833aec1236c9
+```
+
+Use environment variables. Do not hardcode either value in the bot source.
+
+Only these public routes are part of the contract:
+
+```text
+POST /claim
+POST /deliveries/next
+POST /deliveries/{delivery_id}/result
+```
+
+Always use `POST`. Do not call `/api/...` aliases or rely on `GET` behavior.
+
+## What the bot must do
+
+The delivery worker repeatedly requests the next eligible delivery, delivers every returned item in Roblox, and reports exactly one final outcome.
+
+```text
+POST /deliveries/next
+  -> 204: no work; wait and poll again
+  -> 200: persist the DTO and deliver every item
+       -> all items delivered: POST /result with completed:true
+       -> definite delivery failure: POST /result with completed:false
+       -> uncertain HTTP response: retry the exact same /result
+```
+
+Important rules:
+
+- Persist the complete delivery DTO before entering Roblox.
+- Treat `delivery_id` as an opaque string.
+- Never modify, shorten, decode, or reconstruct `delivery_id`.
+- Never use `order_number` instead of `delivery_id`.
+- Deliver every item and its exact `quantity`.
+- Select game automation using `items[].game.id`.
+- Select the item using `items[].item_code`.
+- Never identify an item using its visible title alone.
+- Send `completed:true` only after all items were actually delivered.
+- Do not call `/next` again while a reserved delivery has an unresolved result.
+- Clear locally persisted delivery state only after `/result` returns `200`.
+
+## Authentication
+
+`/deliveries/next` and `/deliveries/{delivery_id}/result` require:
+
+```http
+Authorization: Bearer DELIVERY_API_KEY
+```
+
+The scheme, one space, and exact key are required. Missing or incorrect authentication returns:
+
+```http
+HTTP/1.1 401 Unauthorized
+```
+
+The body is empty. A `401` is not retryable: stop the worker and fix its configuration.
+
+`POST /claim` is public and does not use the delivery API key.
+
+All API responses use:
+
+```http
+Cache-Control: no-store
+```
+
+## 1. Claim an order
+
+This normally comes from the customer-facing claim form, not the delivery loop. It associates a paid Shopify order with a Roblox username.
+
+### Request
+
+```http
+POST /claim
+Content-Type: application/json
+```
+
+```json
+{
+  "order_number": "1009",
+  "email": "customer@example.com",
+  "roblox_username": "ExamplePlayer"
+}
+```
+
+`order_number` may include or omit `#`. The email must exactly match the Shopify order contact email.
+
+### Response
+
+```http
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+```
+
+```json
+{"accepted":true}
+```
+
+The response is intentionally generic. `202` means the request was evaluated; it does not reveal whether the order/email combination existed or was eligible.
+
+Do not repeat a successful structural claim merely because `/next` initially returns `204`.
+
+Possible responses:
+
+| HTTP | Bot/client action |
+|---:|---|
+| `202` | Claim evaluated. Begin or continue normal `/next` polling. |
+| `400` | Fix invalid JSON or fields. Do not retry unchanged input. |
+| `503` | Retry with bounded backoff. |
+
+## 2. Request the next delivery
+
+### Request
+
+```http
+POST /deliveries/next
+Authorization: Bearer DELIVERY_API_KEY
+```
+
+No body is required.
+
+### No delivery available
+
+```http
+HTTP/1.1 204 No Content
+```
+
+This is normal idle behavior. Wait 3 seconds and poll again. Never run a tight loop.
+
+Shopify indexes order metafields asynchronously, so several `204` responses may occur immediately after a valid claim.
+
+### Delivery available
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+```
+
+```json
+{
+  "delivery_id": "opaque-delivery-id",
+  "order_number": "#1009",
+  "roblox_username": "ExamplePlayer",
+  "items": [
+    {
+      "game": {
+        "id": "murdermystery2",
+        "name": "Murder Mystery 2"
+      },
+      "display_name": "Seer",
+      "item_code": "Seer",
+      "quantity": 1
+    }
+  ]
+}
+```
+
+The DTO contains no customer email, address, price, Shopify GID, credentials, or Service Fee item.
+
+Validate before starting delivery:
+
+- `delivery_id` is a non-empty string.
+- `order_number` is a non-empty support reference.
+- `roblox_username` is a non-empty string.
+- `items` is a non-empty array.
+- Every item has `game.id === "murdermystery2"`.
+- Every item has a non-empty `item_code`.
+- Every `quantity` is a positive integer.
+
+If the DTO is malformed or includes another game, do not deliver it and alert the API operator. Do not invent corrected values.
+
+Possible responses:
+
+| HTTP | Worker action |
+|---:|---|
+| `200` | Persist and process this delivery. |
+| `204` | Wait 3 seconds and poll again. |
+| `401` | Stop; API key is missing or invalid. |
+| `503` | Retry `/next` with bounded backoff. |
+
+## MM2-only behavior
+
+The server, not the bot, filters the Shopify queue:
+
+- Service Fee lines are ignored.
+- At least one deliverable item must remain.
+- Every deliverable item must have canonical game ID `murdermystery2`.
+- MM2 plus Service Fee is eligible.
+- Another game by itself is skipped.
+- MM2 mixed with another game is skipped.
+- Skipped orders are not reserved, returned, or marked failed.
+
+The bot must still validate `game.id` defensively before automation. Never filter by `display_name` or Shopify product title.
+
+## 3. Report the delivery result
+
+Use the exact `delivery_id` returned by `/next` as the URL path value.
+
+```http
+POST /deliveries/{delivery_id}/result
+Authorization: Bearer DELIVERY_API_KEY
+Content-Type: application/json
+```
+
+### Successful Roblox delivery
+
+Only after every item was delivered:
+
+```json
+{"completed":true}
+```
+
+Successful response:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+```
+
+```json
+{"ok":true}
+```
+
+`completed:true` immediately authorizes the API to create the Shopify fulfillment. Shopify fulfillment is the completed state; there is no separate `delivery_status=completed` value.
+
+The operation is idempotent. Repeating the identical URL and body after a lost or uncertain response returns `200` without creating a duplicate fulfillment.
+
+### Failed Roblox delivery
+
+When the delivery definitely failed:
+
+```json
+{
+  "completed": false,
+  "reason": "Player did not join"
+}
+```
+
+`reason` is optional. When provided, it must be non-empty plain text with at most 240 characters.
+
+Do not send `failure_reason`; the public field is `reason`.
+
+`completed:false` records the order as failed and creates no Shopify fulfillment. Retrying the same failure is safe; the first reason is preserved.
+
+### Result retry behavior
+
+Shopify may take several seconds to index a `delivery_id` immediately after `/next` returns `200`. During this propagation window, `/result` can temporarily return `404`.
+
+For a timeout, connection reset, `503`, or an initial `404`:
+
+1. Keep the exact same `delivery_id`.
+2. Keep the same `completed` value.
+3. Keep the same `reason`, if present.
+4. Retry the identical request.
+5. Do not call `/next` for replacement work.
+
+Recommended bounded schedule:
+
+```text
+1 second -> 2 seconds -> 4 seconds -> 8 seconds -> 12 seconds
+Maximum: 8 attempts or 45 seconds total
+```
+
+An initial `404` is retryable only for the identifier just returned by `/next`. If it remains `404` after the bounded window, stop that delivery and report it to the operator.
+
+Possible responses:
+
+| HTTP | Worker action |
+|---:|---|
+| `200` | Result confirmed. Clear persisted delivery state. |
+| `400` | Request is invalid. Stop and report the implementation error. |
+| `401` | Stop the worker and fix its API key. |
+| Initial `404` | Retry the exact result with bounded backoff. |
+| Persistent `404` | Stop and report; do not request replacement work. |
+| `409` | Stop and report a delivery-state conflict. |
+| `503` | Retry the exact result with bounded backoff. |
+| Timeout/reset | Retry the exact result; its outcome may already have been recorded. |
+
+## Reference worker algorithm
+
+```text
+load persisted unresolved delivery, if one exists
+
+while running:
+  if an unresolved delivery exists:
+    resume it or resend its persisted final result
+    do not call /next
+    continue
+
+  response = POST /deliveries/next with Bearer key and 25-second timeout
+
+  if response == 204:
+    wait 3 seconds
+    continue
+
+  if response == 401:
+    stop worker and alert operator
+
+  if response == 503 or transport failed:
+    bounded backoff
+    continue
+
+  if response != 200:
+    alert operator
+    bounded backoff
+    continue
+
+  validate delivery DTO
+  persist complete DTO atomically
+
+  outcome = deliver every item using game.id + item_code + quantity
+
+  persist final result before sending it
+
+  if outcome succeeded:
+    result body = {completed: true}
+  else:
+    result body = {completed: false, reason: safe short reason}
+
+  retry identical POST /deliveries/{delivery_id}/result until 200
+  apply the bounded result rules above
+
+  after 200 only:
+    clear persisted DTO and result
+```
+
+Use a 25-second HTTP timeout for every individual request. A client timeout does not prove the server failed; retry idempotently according to the tables above.
+
+## curl examples
+
+Claim:
+
+```bash
+curl --request POST "$DELIVERY_BASE_URL/claim" \
+  --connect-timeout 5 \
+  --max-time 25 \
+  --header "Content-Type: application/json" \
+  --data '{"order_number":"1009","email":"customer@example.com","roblox_username":"ExamplePlayer"}'
+```
+
+Next delivery:
+
+```bash
+curl --request POST "$DELIVERY_BASE_URL/deliveries/next" \
+  --connect-timeout 5 \
+  --max-time 25 \
+  --header "Authorization: Bearer $DELIVERY_API_KEY"
+```
+
+Successful result:
+
+```bash
+curl --request POST "$DELIVERY_BASE_URL/deliveries/<delivery_id>/result" \
+  --connect-timeout 5 \
+  --max-time 25 \
+  --header "Authorization: Bearer $DELIVERY_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{"completed":true}'
+```
+
+Failed result:
+
+```bash
+curl --request POST "$DELIVERY_BASE_URL/deliveries/<delivery_id>/result" \
+  --connect-timeout 5 \
+  --max-time 25 \
+  --header "Authorization: Bearer $DELIVERY_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{"completed":false,"reason":"Player did not join"}'
+```
+
+## Logging requirements
+
+Safe fields to log:
+
+- Endpoint name.
+- HTTP status.
+- Attempt number.
+- Request duration.
+- Local correlation ID.
+- `order_number` when support needs it.
+- `game.id`, `item_code`, and `quantity`.
+
+Never log:
+
+- `DELIVERY_API_KEY` or the Authorization header.
+- Full `delivery_id`.
+- Customer email, name, address, or payment data.
+- Shopify credentials or GIDs.
+- Raw request/response dumps that may contain sensitive values.
+
+## Verified sandbox behavior
+
+The stable endpoint was verified end-to-end on July 24, 2026:
+
+```text
+invalid API key -> 401
+claim -> 202
+next -> temporary 204 responses while Shopify indexed the claim
+next -> 200 with MM2 Seer x1
+result completed:true -> temporary 404 responses while delivery_id indexed
+same result retry -> 200
+identical completed:true retry -> 200
+Shopify order -> FULFILLED
+active unfulfilled quantity -> 0
+duplicate fulfillment -> none
+```
+
+Verified deployment:
+
+```text
+dpl_3KN5WZosprD6vpC2TxgxB4QzY6Nh
+```
+
+This hostname is a dedicated sandbox connected only to the Stealbox development store. It is not the BloxTop production API.
