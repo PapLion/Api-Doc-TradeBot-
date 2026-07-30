@@ -423,3 +423,113 @@ dpl_3KN5WZosprD6vpC2TxgxB4QzY6Nh
 ```
 
 This hostname is a dedicated sandbox connected only to the Stealbox development store. It is not the BloxTop production API.
+
+---
+
+## Update: MM2 inventory snapshot endpoint
+
+This is a new endpoint for the bot's real Roblox inventory. It does not change
+the existing claim or delivery endpoints.
+
+### What the bot must do
+
+The bot remains the source of truth for the items it physically has. Whenever
+its MM2 inventory changes, it should send a complete current snapshot to
+BloxTop, rather than trying to calculate a separate Shopify adjustment for each
+trade.
+
+```text
+Bot inventory changes
+  -> bot sends its current MM2 stock list
+  -> BloxTop validates each item as MM2
+  -> BloxTop updates Shopify inventory
+  -> Shopify controls whether the product can still be purchased
+```
+
+The bot does **not** need to query Shopify or decrement Shopify stock after a
+normal delivery. Shopify already handles stock reserved or consumed by customer
+purchases. The bot only reports what it currently has in Roblox.
+
+### Request
+
+```text
+PUT /inventory/snapshot
+Authorization: Bearer <DELIVERY_API_KEY>
+Content-Type: application/json
+```
+
+It uses the same `DELIVERY_API_KEY` as `/deliveries/next` and
+`/deliveries/{delivery_id}/result`.
+
+```json
+{
+  "snapshot_id": "550e8400-e29b-41d4-a716-446655440000",
+  "items": [
+    {"item_code": "Lightbringer", "quantity": 3},
+    {"item_code": "Gemstone", "quantity": 1}
+  ]
+}
+```
+
+Requirements:
+
+- `snapshot_id` must be a new UUID for each newly generated snapshot.
+- Reuse the **same** `snapshot_id` and exactly the same body when retrying a
+  request after a timeout or connection failure.
+- `items` is the bot's full current MM2 inventory list, not a `+1` / `-1`
+  adjustment list.
+- `item_code` must match the BloxTop variant item code exactly.
+- `quantity` is a non-negative integer. Use `0` when the bot has no units.
+- Do not include Service Fee or items from another game.
+
+### Successful response
+
+```json
+{
+  "ok": true,
+  "received_items": 2,
+  "updated_items": 2
+}
+```
+
+After `200`, Shopify has accepted the stock snapshot. Repeating the same
+snapshot is safe and does not create an extra stock adjustment.
+
+### Errors and retries
+
+- `401`: the delivery API key is missing or invalid. Do not retry until the
+  configuration is fixed.
+- `422`: an item is not a valid automatic MM2 item or the body is invalid. Fix
+  the inventory data; do not retry unchanged.
+- `503`, timeout, or network failure: retain the snapshot locally and retry the
+  identical request with bounded backoff.
+
+For local testing, a JSON file is sufficient to persist the last unsent
+snapshot. For a long-running production bot, SQLite is safer.
+
+### curl example
+
+```bash
+curl --request PUT "$DELIVERY_BASE_URL/inventory/snapshot" \
+  --connect-timeout 5 \
+  --max-time 25 \
+  --header "Authorization: Bearer $DELIVERY_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "snapshot_id":"550e8400-e29b-41d4-a716-446655440000",
+    "items":[
+      {"item_code":"Lightbringer","quantity":3},
+      {"item_code":"Gemstone","quantity":1}
+    ]
+  }'
+```
+
+### Safety guarantees
+
+- BloxTop accepts only variants whose real Shopify configuration says they are
+  Murder Mystery 2 items.
+- Service Fee and other games are rejected and cannot be changed through this
+  endpoint.
+- The endpoint updates stock in the dedicated MM2 bot inventory location.
+- This endpoint does not alter `/claim`, `/deliveries/next`, or
+  `/deliveries/{delivery_id}/result`.
