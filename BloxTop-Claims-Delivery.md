@@ -17,6 +17,8 @@ Only these public routes are part of the contract:
 
 ```text
 POST /claim
+POST /deliveries
+POST /deliveries/reserve
 POST /deliveries/next
 POST /deliveries/{delivery_id}/result
 ```
@@ -73,6 +75,93 @@ All API responses use:
 ```http
 Cache-Control: no-store
 ```
+
+## Optional: inspect and choose a pending delivery
+
+The normal worker flow remains `/deliveries/next` followed by `/result`.
+These two optional endpoints are for a bot that needs to choose its own order
+based on its local trade or inventory logic.
+
+Only customer-confirmed MM2 claims appear here. A Shopify purchase where the
+customer never completed `/claim` is never returned and cannot block another
+delivery.
+
+### Choose one worker mode
+
+**Automatic mode (existing):** call `POST /deliveries/next`. It atomically
+selects and reserves one available delivery for the bot.
+
+**Manual-selection mode (optional):** call `POST /deliveries`, choose an
+`order_number` from the read-only list using the bot's own logic, then call
+`POST /deliveries/reserve` for that exact order.
+
+Both modes return the same reserved-delivery payload and both must finish with
+`POST /deliveries/{delivery_id}/result`. The list endpoint never returns a
+`delivery_id`; that ID is created only after `/next` or `/reserve` reserves the
+claim. Do not try to reserve an already in-flight delivery again.
+
+### List pending claims
+
+```http
+POST /deliveries
+Authorization: Bearer DELIVERY_API_KEY
+```
+
+This is read-only: it does not reserve, reorder, or change any delivery.
+
+```bash
+curl --request POST "$DELIVERY_BASE_URL/deliveries" \
+  --header "Authorization: Bearer $DELIVERY_API_KEY"
+```
+
+```json
+{
+  "deliveries": [
+    {
+      "order_number": "#1009",
+      "roblox_username": "ExamplePlayer",
+      "items": [
+        {
+          "game": {"id": "murdermystery2", "name": "Murder Mystery 2"},
+          "display_name": "Seer",
+          "item_code": "Seer",
+          "quantity": 1
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Reserve a selected claim
+
+```http
+POST /deliveries/reserve
+Authorization: Bearer DELIVERY_API_KEY
+Content-Type: application/json
+```
+
+```json
+{"order_number":"#1009"}
+```
+
+```bash
+curl --request POST "$DELIVERY_BASE_URL/deliveries/reserve" \
+  --header "Authorization: Bearer $DELIVERY_API_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{"order_number":"#1009"}'
+```
+
+If it is still pending and eligible, the API atomically reserves it and
+returns the same delivery DTO as `/deliveries/next`, including `delivery_id`.
+Use that identifier with `/deliveries/{delivery_id}/result` exactly as usual.
+
+- `200`: reservation succeeded; persist and process the returned delivery.
+- `409`: it is no longer pending or another worker already reserved it; refresh
+  the list and choose again.
+- `400`: invalid request body; fix it instead of retrying unchanged.
+- `401`: missing or incorrect API key.
+- `503`: Shopify is temporarily unavailable; retry with bounded backoff.
 
 ## 1. Claim an order
 
