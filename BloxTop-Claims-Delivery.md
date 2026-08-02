@@ -21,6 +21,8 @@ POST /deliveries
 POST /deliveries/reserve
 POST /deliveries/next
 POST /deliveries/{delivery_id}/result
+POST /deliveries/{delivery_id}/release
+POST /deliveries/{delivery_id}/retry-required
 ```
 
 Always use `POST`. Do not call `/api/...` aliases or rely on `GET` behavior.
@@ -34,6 +36,9 @@ POST /deliveries/next
   -> 204: no work; wait and poll again
   -> 200: persist the DTO and deliver every item
        -> all items delivered: POST /result with completed:true
+       -> temporary technical issue: persist and retry locally; do not call the API
+       -> player absent/cancelled but may retry: POST /release
+       -> player must start Claim again: POST /retry-required
        -> definite delivery failure: POST /result with completed:false
        -> uncertain HTTP response: retry the exact same /result
 ```
@@ -51,6 +56,58 @@ Important rules:
 - Send `completed:true` only after all items were actually delivered.
 - Do not call `/next` again while a reserved delivery has an unresolved result.
 - Clear locally persisted delivery state only after `/result` returns `200`.
+
+## Delivery outcomes and retries
+
+The bot, not the website, decides whether a Roblox trade is temporarily
+retryable or terminal.
+
+| Situation | Bot action |
+|---|---|
+| Roblox/network error or bot restart | Keep the same persisted `delivery_id` and retry internally. Do not call BloxTop yet. |
+| Player does not join or cancels but can try again later | Call `/release`. The order returns to the pending list immediately. |
+| Player selected the wrong Roblox account or must restart the claim flow | Call `/retry-required`. The order disappears from the bot list until the buyer completes Claim again. |
+| Fraud, impossible delivery, or a final business failure | Call `/result` with `completed:false`. This is terminal and goes to support. |
+| Every item delivered | Call `/result` with `completed:true`. Shopify creates the fulfillment. |
+
+### Release a delivery for another attempt
+
+```http
+POST /deliveries/{delivery_id}/release
+Authorization: Bearer DELIVERY_API_KEY
+Content-Type: application/json
+```
+
+```json
+{"reason":"Player did not join"}
+```
+
+`reason` is optional. A successful call returns `200 {"ok":true}` and puts
+the same order back in the pending list immediately. The old `delivery_id` is
+no longer valid for `/result`; when the bot reserves the order again, it gets a
+new `delivery_id`.
+
+### Require the buyer to Claim again
+
+```http
+POST /deliveries/{delivery_id}/retry-required
+Authorization: Bearer DELIVERY_API_KEY
+Content-Type: application/json
+```
+
+```json
+{"reason":"Confirm another Roblox account"}
+```
+
+`reason` is optional. A successful call returns `200 {"ok":true}`. This does
+not mark the order as terminally failed. It removes it from the bot queue until
+the buyer completes `/claim` again with their order number, email, and a
+confirmed Roblox username. The buyer may choose a different Roblox username.
+
+Both routes are idempotent: if their successful HTTP response is lost, retry
+the exact same request. They return `401` for a bad key, `404` for an unknown
+or replaced delivery ID, `409` for a delivery that cannot transition, and
+`503` when Shopify is temporarily unavailable.
 
 ## Authentication
 
