@@ -20,6 +20,7 @@ POST /claim
 POST /deliveries
 POST /deliveries/reserve
 POST /deliveries/next
+POST /deliveries/reconcile
 POST /deliveries/{delivery_id}/result
 POST /deliveries/{delivery_id}/release
 POST /deliveries/{delivery_id}/retry-required
@@ -219,6 +220,62 @@ Use that identifier with `/deliveries/{delivery_id}/result` exactly as usual.
 - `400`: invalid request body; fix it instead of retrying unchanged.
 - `401`: missing or incorrect API key.
 - `503`: Shopify is temporarily unavailable; retry with bounded backoff.
+
+### Recover a reservation after a bot restart
+
+If the bot crashes after `/reserve` or `/next` returns `200`, before it can
+persist the delivery DTO, it must recover the existing reservation by order
+number instead of reserving the order again. Re-reserving can return `409` and
+must never create a second delivery.
+
+```http
+POST /deliveries/reconcile
+Authorization: Bearer DELIVERY_API_KEY
+Content-Type: application/json
+```
+
+```bash
+curl --request POST "$DELIVERY_BASE_URL/deliveries/reconcile" \
+  --header "Authorization: Bearer $DELIVERY_API_KEY" \
+  --header "Content-Type: application/json" \
+  --header "Accept: application/json" \
+  --data '{"order_number":"#1009"}'
+```
+
+Successful response:
+
+```json
+{
+  "delivery_id": "opaque-delivery-id",
+  "order_number": "#1009",
+  "roblox_username": "ExamplePlayer",
+  "delivery_status": "processing",
+  "items": [
+    {
+      "game": {"id": "murdermystery2", "name": "Murder Mystery 2"},
+      "display_name": "Seer",
+      "item_code": "Seer",
+      "quantity": 1
+    }
+  ]
+}
+```
+
+This endpoint is read-only: it does not reserve, create a fulfillment, or
+change any Shopify metafield. It returns the persisted `delivery_id` and the
+current status so the bot can resume the same delivery and later call the
+existing `/result`, `/release`, or `/retry-required` endpoint.
+
+- `200`: an existing reservation was recovered.
+- `400`: invalid order number or request body; fix the request.
+- `401`: missing or invalid delivery API key.
+- `404`: no persisted reservation exists for that order number.
+- `405`: method other than `POST`.
+- `503`: Shopify is temporarily unavailable; retry with bounded backoff.
+
+The bot should call this only during recovery when it has an order number but
+no usable persisted `delivery_id`. Repeating the same reconciliation request
+is safe and does not mutate the delivery.
 
 ## 1. Claim an order
 
@@ -436,6 +493,12 @@ Possible responses:
 
 ```text
 load persisted unresolved delivery, if one exists
+
+if no delivery_id is persisted but the bot knows the order number from the
+interrupted job:
+  POST /deliveries/reconcile with that order number
+  if 200: persist the recovered DTO and resume it
+  if 404: report that no reservation can be recovered; do not reserve blindly
 
 while running:
   if an unresolved delivery exists:
