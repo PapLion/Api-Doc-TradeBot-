@@ -63,13 +63,13 @@ Important rules:
 The bot, not the website, decides whether a Roblox trade is temporarily
 retryable or terminal.
 
-| Situation | Bot action |
-|---|---|
-| Roblox/network error or bot restart | Keep the same persisted `delivery_id` and retry internally. Do not call BloxTop yet. |
-| Player does not join or cancels but can try again later | Call `/release`. The order returns to the pending list immediately. |
+| Situation                                                               | Bot action                                                                                            |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Roblox/network error or bot restart                                     | Keep the same persisted `delivery_id` and retry internally. Do not call BloxTop yet.                  |
+| Player does not join or cancels but can try again later                 | Call `/release`. The order returns to the pending list immediately.                                   |
 | Player selected the wrong Roblox account or must restart the claim flow | Call `/retry-required`. The order disappears from the bot list until the buyer completes Claim again. |
-| Fraud, impossible delivery, or a final business failure | Call `/result` with `completed:false`. This is terminal and goes to support. |
-| Every item delivered | Call `/result` with `completed:true`. Shopify creates the fulfillment. |
+| Fraud, impossible delivery, or a final business failure                 | Call `/result` with `completed:false`. This is terminal and goes to support.                          |
+| Every item delivered                                                    | Call `/result` with `completed:true`. Shopify creates the fulfillment.                                |
 
 ### Release a delivery for another attempt
 
@@ -80,7 +80,7 @@ Content-Type: application/json
 ```
 
 ```json
-{"reason":"Player did not join"}
+{"reason": "Player did not join"}
 ```
 
 `reason` is optional. A successful call returns `200 {"ok":true}` and puts
@@ -97,7 +97,7 @@ Content-Type: application/json
 ```
 
 ```json
-{"reason":"Confirm another Roblox account"}
+{"reason": "Confirm another Roblox account"}
 ```
 
 `reason` is optional. A successful call returns `200 {"ok":true}`. This does
@@ -134,11 +134,12 @@ All API responses use:
 Cache-Control: no-store
 ```
 
-## Optional: inspect and choose a pending delivery
+## Inspect pending and processing deliveries
 
-The normal worker flow remains `/deliveries/next` followed by `/result`.
-These two optional endpoints are for a bot that needs to choose its own order
-based on its local trade or inventory logic.
+`POST /deliveries` is a read-only view of the bot queue. It returns both
+customer-confirmed MM2 claims that are waiting (`pending`) and reservations
+already owned by the bot (`processing`). It does not reserve, reorder, or
+change any delivery.
 
 Only customer-confirmed MM2 claims appear here. A Shopify purchase where the
 customer never completed `/claim` is never returned and cannot block another
@@ -150,22 +151,19 @@ delivery.
 selects and reserves one available delivery for the bot.
 
 **Manual-selection mode (optional):** call `POST /deliveries`, choose an
-`order_number` from the read-only list using the bot's own logic, then call
+entry with `status: "pending"` using the bot's own logic, then call
 `POST /deliveries/reserve` for that exact order.
 
-Both modes return the same reserved-delivery payload and both must finish with
-`POST /deliveries/{delivery_id}/result`. The list endpoint never returns a
-`delivery_id`; that ID is created only after `/next` or `/reserve` reserves the
-claim. Do not try to reserve an already in-flight delivery again.
+The normal worker flow remains `/deliveries/next` followed by `/result`.
+Entries with `status: "processing"` are already reserved and must not be
+reserved again; the bot must continue using their returned `delivery_id`.
 
-### List pending claims
+### List pending claims and processing reservations
 
 ```http
 POST /deliveries
 Authorization: Bearer DELIVERY_API_KEY
 ```
-
-This is read-only: it does not reserve, reorder, or change any delivery.
 
 ```bash
 curl --request POST "$DELIVERY_BASE_URL/deliveries" \
@@ -176,9 +174,33 @@ curl --request POST "$DELIVERY_BASE_URL/deliveries" \
 {
   "deliveries": [
     {
+      "status": "pending",
       "order_number": "#1009",
       "roblox_username": "ExamplePlayer",
       "items": [
+        {
+          "game": {"id": "murdermystery2", "name": "Murder Mystery 2"},
+          "display_name": "Seer",
+          "item_code": "Seer",
+          "quantity": 1
+        }
+      ]
+    }
+    },
+    {
+      "status": "processing",
+      "delivery_id": "opaque-delivery-id",
+      "order_number": "#1010",
+      "roblox_username": "ExamplePlayer",
+      "items": [
+        {
+          "game": {"id": "murdermystery2", "name": "Murder Mystery 2"},
+          "display_name": "Seer",
+          "item_code": "Seer",
+          "quantity": 3
+        }
+      ],
+      "remaining_items": [
         {
           "game": {"id": "murdermystery2", "name": "Murder Mystery 2"},
           "display_name": "Seer",
@@ -191,6 +213,15 @@ curl --request POST "$DELIVERY_BASE_URL/deliveries" \
 }
 ```
 
+Every element includes `status`. Pending entries do not include
+`delivery_id`. Processing entries include the complete reserved-delivery DTO,
+including `delivery_id`, and should be resumed with that same identifier.
+`remaining_items` is informational: it appears only when Shopify already
+reports a quantity difference between the original order and the currently
+unfulfilled quantity. The current public result contract is all-or-nothing;
+the bot must call `completed:true` only after all items are delivered. The API
+does not yet expose a partial-progress operation for individual Roblox trades.
+
 ### Reserve a selected claim
 
 ```http
@@ -200,7 +231,7 @@ Content-Type: application/json
 ```
 
 ```json
-{"order_number":"#1009"}
+{"order_number": "#1009"}
 ```
 
 ```bash
@@ -221,7 +252,7 @@ Use that identifier with `/deliveries/{delivery_id}/result` exactly as usual.
 - `401`: missing or incorrect API key.
 - `503`: Shopify is temporarily unavailable; retry with bounded backoff.
 
-### Recover a reservation after a bot restart
+### Recover a reservation after a bot restart (compatibility)
 
 If the bot crashes after `/reserve` or `/next` returns `200`, before it can
 persist the delivery DTO, it must recover the existing reservation by order
@@ -266,6 +297,10 @@ change any Shopify metafield. It returns the persisted `delivery_id` and the
 current status so the bot can resume the same delivery and later call the
 existing `/result`, `/release`, or `/retry-required` endpoint.
 
+New bot implementations should prefer `POST /deliveries`: a `processing`
+entry already includes the same `delivery_id`. This endpoint remains available
+for older bots that only retained the order number after a restart.
+
 - `200`: an existing reservation was recovered.
 - `400`: invalid order number or request body; fix the request.
 - `401`: missing or invalid delivery API key.
@@ -306,7 +341,7 @@ Content-Type: application/json
 ```
 
 ```json
-{"accepted":true}
+{"accepted": true}
 ```
 
 The response is intentionally generic. `202` means the request was evaluated; it does not reveal whether the order/email combination existed or was eligible.
@@ -315,11 +350,11 @@ Do not repeat a successful structural claim merely because `/next` initially ret
 
 Possible responses:
 
-| HTTP | Bot/client action |
-|---:|---|
+|  HTTP | Bot/client action                                          |
+| ----: | ---------------------------------------------------------- |
 | `202` | Claim evaluated. Begin or continue normal `/next` polling. |
-| `400` | Fix invalid JSON or fields. Do not retry unchanged input. |
-| `503` | Retry with bounded backoff. |
+| `400` | Fix invalid JSON or fields. Do not retry unchanged input.  |
+| `503` | Retry with bounded backoff.                                |
 
 ## 2. Request the next delivery
 
@@ -384,12 +419,12 @@ If the DTO is malformed or includes another game, do not deliver it and alert th
 
 Possible responses:
 
-| HTTP | Worker action |
-|---:|---|
-| `200` | Persist and process this delivery. |
-| `204` | Wait 3 seconds and poll again. |
+|  HTTP | Worker action                        |
+| ----: | ------------------------------------ |
+| `200` | Persist and process this delivery.   |
+| `204` | Wait 3 seconds and poll again.       |
 | `401` | Stop; API key is missing or invalid. |
-| `503` | Retry `/next` with bounded backoff. |
+| `503` | Retry `/next` with bounded backoff.  |
 
 ## MM2-only behavior
 
@@ -420,7 +455,7 @@ Content-Type: application/json
 Only after every item was delivered:
 
 ```json
-{"completed":true}
+{"completed": true}
 ```
 
 Successful response:
@@ -431,7 +466,7 @@ Content-Type: application/json
 ```
 
 ```json
-{"ok":true}
+{"ok": true}
 ```
 
 `completed:true` immediately authorizes the API to create the Shopify fulfillment. Shopify fulfillment is the completed state; there is no separate `delivery_status=completed` value.
@@ -478,16 +513,16 @@ An initial `404` is retryable only for the identifier just returned by `/next`. 
 
 Possible responses:
 
-| HTTP | Worker action |
-|---:|---|
-| `200` | Result confirmed. Clear persisted delivery state. |
-| `400` | Request is invalid. Stop and report the implementation error. |
-| `401` | Stop the worker and fix its API key. |
-| Initial `404` | Retry the exact result with bounded backoff. |
-| Persistent `404` | Stop and report; do not request replacement work. |
-| `409` | Stop and report a delivery-state conflict. |
-| `503` | Retry the exact result with bounded backoff. |
-| Timeout/reset | Retry the exact result; its outcome may already have been recorded. |
+|             HTTP | Worker action                                                       |
+| ---------------: | ------------------------------------------------------------------- |
+|            `200` | Result confirmed. Clear persisted delivery state.                   |
+|            `400` | Request is invalid. Stop and report the implementation error.       |
+|            `401` | Stop the worker and fix its API key.                                |
+|    Initial `404` | Retry the exact result with bounded backoff.                        |
+| Persistent `404` | Stop and report; do not request replacement work.                   |
+|            `409` | Stop and report a delivery-state conflict.                          |
+|            `503` | Retry the exact result with bounded backoff.                        |
+|    Timeout/reset | Retry the exact result; its outcome may already have been recorded. |
 
 ## Reference worker algorithm
 
@@ -496,9 +531,10 @@ load persisted unresolved delivery, if one exists
 
 if no delivery_id is persisted but the bot knows the order number from the
 interrupted job:
-  POST /deliveries/reconcile with that order number
-  if 200: persist the recovered DTO and resume it
-  if 404: report that no reservation can be recovered; do not reserve blindly
+  POST /deliveries and find the exact processing entry
+  if found: persist that DTO and resume it with its delivery_id
+  if not found: use /deliveries/reconcile for backwards compatibility
+  if still not found: report that no reservation can be recovered; do not reserve blindly
 
 while running:
   if an unresolved delivery exists:
