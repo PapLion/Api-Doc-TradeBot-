@@ -8,7 +8,7 @@ Use this environment only for Stealbox sandbox testing. Do not send these creden
 
 ```env
 DELIVERY_BASE_URL=https://bloxtop-delivery-sandbox.vercel.app
-DELIVERY_API_KEY=1a7fbd75b08a9a7e491597d51cf40781da5e9045f3c5fa77f5b9833aec1236c9
+DELIVERY_API_KEY=<set-in-secret-manager>
 ```
 
 Use environment variables. Do not hardcode either value in the bot source.
@@ -249,7 +249,7 @@ Successful response:
   "delivery_id": "opaque-delivery-id",
   "order_number": "#1009",
   "roblox_username": "ExamplePlayer",
-  "delivery_status": "processing",
+  "status": "processing",
   "items": [
     {
       "game": {"id": "murdermystery2", "name": "Murder Mystery 2"},
