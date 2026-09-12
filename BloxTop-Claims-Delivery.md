@@ -221,6 +221,11 @@ reports a quantity difference between the original order and the currently
 unfulfilled quantity. The current public result contract is all-or-nothing;
 the bot must call `completed:true` only after all items are delivered. The API
 does not yet expose a partial-progress operation for individual Roblox trades.
+If no quantity remains, `remaining_items` is omitted rather than returned as
+an empty array. A `processing` MM2 reservation remains visible even when an
+unrelated line from the same order has already reached zero quantity; an
+unrelated line with remaining quantity still makes the order ineligible for
+the automatic MM2 queue.
 
 ### Reserve a selected claim
 
